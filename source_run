@@ -1,0 +1,279 @@
+function run_source()
+% RUN_SOURCE runs the source analysis on each individual subject, aligning
+% the source model with each subject headmodel, and then also loads a template MRI. The
+% Brainnetome atlas is then also loaded from the HCP folder on the server.
+% Single trial data is parcellated using the ft_virtualchannel function,
+% which outputs the data in the shape of trials x parcels x time. Each
+% trial from the dataset was arbitrarily cut to 2 seconds, so a subject
+% file usually has the shape of 147x245x1018.
+
+%% Set up paths based on whether the script is run locally or on server
+
+if ispc % local machine
+    
+    basepath = 'D://'; % currently using basepath of external hard drive
+                       % for case of running locally at the Institute,
+                       % should use path to LNDG folder
+    addpath(basepath); 
+
+    % set fieldtrip path
+    % fieldtrip_dir = '/Users/stojanovic/Documents/Projects/MaxPlanck/Toolboxes/fieldtrip-20220104/'; % Marta's local path
+    fieldtrip_dir   = 'D://fieldtrip-20220104';
+    addpath(fieldtrip_dir);
+    
+    % run fieldtrip defaults
+    ft_defaults
+    
+    % add megconnectome functions
+    addpath(genpath('D://megconnectome-3.0'));
+    
+    MODIN   = fullfile(basepath, 'MEG/');       % directory for MEG files 
+    MODOUT  = fullfile(basepath,'SOURCEDATA/'); % output folder for storing source data
+    ATLAS   = fullfile(basepath, 'BrainnetomeAtlasViewer-2/'); % atlas
+    
+else % for TARDIS (remote server)
+    
+    % set basepath
+    basepath = '/home/mpib/stojanovic/'; % can be changed to another user
+
+    % add relevant paths
+    fieldtrip_dir = '/home/mpib/stojanovic/fieldtrip-20220104/';
+    addpath(fieldtrip_dir);
+
+    addpath(basepath, 'qsub_tardis_slurmpreview/');
+    addpath(genpath('/home/mpib/stojanovic/megconnectome-master/'));
+
+    % call fieldtrip defaults
+    ft_defaults;
+
+    % set up paths for MEG data to input and for output folder
+    MODIN   = fullfile(basepath, 'MEG/MEG/');
+    MODOUT  = fullfile(basepath,'SOURCEDATA/'); % folder in which to store source data
+    ATLAS   = fullfile(basepath, 'BrainnetomeAtlasViewer-2/'); % atlas
+
+    backend = 'slurm';
+    compile = 'no';
+    overwrite = 1;
+end
+
+% specify resource allocation on TARDIS
+stack = 1;
+timreq = 240;       % in minutes per run
+memreq = 50*1024^3; % 50 GB
+
+
+%check if dir exists, if not, create it
+checkdir = exist(MODOUT); % returns 7 if dir is an existing folder
+                          % only set up directory if it isn't already one
+if checkdir ~= 7
+    mkdir(MODOUT) % set up dir if 7 is not returned
+end
+
+   
+%% load atlas
+
+atlas = ft_read_atlas([fieldtrip_dir '/template/atlas/brainnetome/BNA_MPM_thr25_1.25mm.nii']); % Brainnetome
+% atlas = ft_read_atlas([fieldtrip_dir 'template/atlas/aal/ROI_MNI_V4.nii']); % AAL
+
+%% list HCP subjects
+
+sub = {'100307'}; % test for one subject
+
+%% make configurations (cfg) list
+% initialise configurations per subject
+cfg         = [];
+cfglist     = {};
+
+% loop over the configurations across subjects 
+for isub = 1:length(sub)
+    
+    % configure input data and output
+    cfg.MODIN   = MODIN;  % input
+    cfg.MODOUT  = MODOUT; % output
+    
+    ff = filesep; % file seperator (different for Mac or Windows)
+    
+    % subject data 
+    % currently in correct form for external hard drive when run locally
+    % check in LNDG folder for the structure of the paths
+    subfolder  = [MODIN sub{isub}];
+    restfile   = [subfolder ff [sub{isub} '_' 'MEG_3-Restin_rmegpreproc.mat']];
+    anatfile   = [subfolder ff [sub{isub} '_' 'MEG_anatomy_transform.txt']]; % anatomy file
+    mrifile    = [subfolder ff 'T1w_acpc_dc_restore.nii.gz'];
+    headfile   = [subfolder ff [sub{isub} '_' 'MEG_anatomy_headmodel.mat']]; % head model
+    smodfile   = [subfolder ff [sub{isub} '_' 'MEG_anatomy_sourcemodel_3d8mm.mat']]; % source model
+    
+    cfg.restfile = restfile;  % input
+    cfg.outfile  = [MODOUT sub{isub} 'source_parcel.mat']; % output
+    cfg.anatfile = anatfile;  % anatomy
+    cfg.mrifile  = mrifile;   % subject mri
+    cfg.headmod  = headfile;  % head model
+    cfg.smod     = smodfile;  % source model
+    cfg.subjno   = sub(isub); % subject number
+    
+    if ~exist(cfg.outfile, 'file') || overwrite
+        cfglist = [cfglist cfg];
+    end
+end 
+disp('Done initialising configurations list')
+
+%% shuffle configurations and check
+
+% shuffle list of configs to run
+cfglist = cfglist(randsample(length(cfglist),length(cfglist)));
+disp('Done randomly shuffling config list')
+
+%% pass necessary configurations
+
+% set up configurations
+restfile   = cfg.restfile; 
+anatfile   = cfg.anatfile;
+headfile   = cfg.headmod;
+smodfile   = cfg.smod;  
+subjno     = cfg.subjno;
+
+disp(cfg.MODIN);
+cd(cfg.MODOUT);
+disp('Done passing configurations')
+
+%% load necessary files 
+
+% data per subject 
+load(restfile);
+disp('Restfile loaded')
+
+% head model 
+tmp = load(headfile);
+hm  = tmp.headmodel;
+hm  = ft_convert_units(hm, 'mm');
+
+% source model
+tmp = load(smodfile);
+sm  = tmp.sourcemodel3d;
+sm  = ft_convert_units(sm, 'mm'); % can also be cm
+disp('Done converting head and sourcemodels')
+
+%% apply transformation 
+
+% get subject-specific anatomy file and apply transformation to ensure MNI
+% apply transformation matrix per subject
+tmat = hcp_read_ascii(anatfile); 
+T = tmat.transform.bti2spm;
+
+% transform headmodel and sourcemodel into MNI space as well
+hm_trans = ft_transform_geometry(T, hm);
+hm_trans.coordsys = 'mni';
+
+sm_trans = ft_transform_geometry(T, sm);
+sm_trans.coordsys = 'mni';
+disp('Done applying transformations')
+
+%% filter data from resting-state file
+
+cfg  = [];
+cfg.bpfilter = 'yes';
+cfg.bpfreq   = [1 80];
+data = ft_preprocessing(cfg, data);
+disp('Done preprocessing data')
+
+%% load mri
+
+mri = ft_read_mri(mrifile);
+mri.coordsys = 'mni';
+% mri = ft_read_mri('T1w_acpc_dc_restore.nii.gz'); % can also navigate to
+% relevant mri folder by hand to read
+disp('MRI read')
+
+%% get covariance
+
+% obtain covariance matrix, timelocking trials
+clear tlck;
+cfg = [];
+cfg.preproc.demean = 'yes';
+cfg.preproc.baselinewindow = 'all';
+cfg.covariance = 'yes';
+tlck = ft_timelockanalysis(cfg, data);
+disp('Done creating covariance matrix')
+
+%% tlck of all trials
+
+% retain time dimension in timelock of trials
+clear tlck_all;
+cfg = [];
+cfg.preproc.demean = 'yes';
+cfg.preproc.baselinewindow = 'all';
+cfg.covariance = 'yes';
+cfg.keeptrials = 'yes';
+tlck_all = ft_timelockanalysis(cfg, data);
+disp('Done timelocking all trials, keeping trial info')
+
+%% get reg kappa and run beamformer (LCMV)
+
+[u,s,v] = svd(((tlck.cov)));
+d       = -diff(log10(diag(s)));
+d       = d./std(d);
+kappa   = find(d>5,1,'first');
+
+%% generate leadfield
+
+clear lf_meg;
+cfg             = [];
+cfg.channel     = tlck.label; % use labels from the covariance matrix
+cfg.grad        = tlck.grad;
+cfg.normalizeparam = 1;
+cfg.method      = 'basedonmri';
+cfg.sourcemodel = sm_trans;
+cfg.headmodel   = hm_trans;
+cfg.reducerank  = 2; % the default for MEG
+cfg.normalize   = 'yes';
+lf_meg          = ft_prepare_leadfield(cfg);
+disp('Done creating leadfield')
+
+%% run source analysis
+
+% obtain source average for reference in source space
+clear source_avg;
+cfg                 = [];
+cfg.lcmv.lambda = '5%';
+cfg.lcmv.kappa = kappa;
+cfg.method          = 'lcmv';
+cfg.lcmv.keepfilter = 'yes';
+cfg.lcmv.fixedori   = 'yes';
+cfg.lcmv.weightnorm = 'unitnoisegain';
+cfg.headmodel   = hm_trans;
+cfg.sourcemodel = lf_meg;
+source_avg      = ft_sourceanalysis(cfg, tlck);
+disp('Done running source analysis')
+
+%% save source data for later plotting 
+
+save(['D://SOURCEDATA/Source_averages' ff cell2mat(subjno) '_source_average'], 'source_avg',...
+        '-V7.3') % change output directory
+disp('Done saving source data')
+
+%% interpolate source data onto atlas
+cfg = [];
+cfg.parameter = 'all';
+cfg.interpmethod = 'nearest';
+atlas_lowres = ft_sourceinterpolate(cfg,atlas,source_avg);
+atlas_lowres.pos = source_avg.pos;
+atlas_lowres.coordsys = 'mni'; % ensure mni space
+disp('Done aligning atlas to source average')
+
+%% Parcellate single trials
+cfg = [];
+cfg.method = 'pca'; % previous error that the number of channels in the montage is inconsistent
+cfg.parcellation = 'tissue';
+parc_trls = ft_virtualchannel(cfg, tlck_all, source_avg, atlas_lowres);
+% parc_trls = ft_virtualchannel(cfg, tlck_all, atlas_lowres);
+disp('Done parcellating single trials')
+
+%% Save data 
+
+ff = filesep; 
+disp('Saving aligned source data')
+save(['D://SOURCEDATA/Source_parc_data' ff cell2mat(subjno) '_parcel_source_data'], 'parc_trls',...
+        '-V7.3')
+% use ft_datatype or ft_checkdata to check the types of data that need to be fed to Fieldtrip functions
+
+end 
